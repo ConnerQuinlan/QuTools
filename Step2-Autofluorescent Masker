@@ -1,0 +1,81 @@
+// THIS IS A FIJI MACRO, not JYTHON
+originalTitle = getTitle();
+getDimensions(width, height, channels, slices, frames);
+channelNames = newArray(channels);
+for (i=1; i<=channels; i++) {
+    setSlice(i);
+    rawLabel = getMetadata("Label");
+    if (rawLabel == "" || lengthOf(rawLabel) > 50) {
+        info = getMetadata("Info");
+        searchString = "ChannelName #" + i + ": ";
+        index = indexOf(info, searchString);
+        if (index != -1) {
+            start = index + lengthOf(searchString);
+            end = indexOf(info, "\n", start);
+            channelNames[i-1] = substring(info, start, end);
+        } else {
+            channelNames[i-1] = "Channel " + i; 
+        }
+    } else {
+        channelNames[i-1] = rawLabel;
+    }
+}
+Dialog.create("Mask Settings");
+Dialog.addNumber("Gaussian Blur (Sigma):", 3.0);
+Dialog.addNumber("Dilation (Expansion):", 10);
+Dialog.addChoice("Threshold Method:", newArray("Li", "Default", "Otsu", "Triangle", "Mean"), "Li");
+Dialog.addMessage("Select channels check for signal in:");
+for (i=0; i<channels; i++) {
+    Dialog.addCheckbox(channelNames[i], true); 
+}
+Dialog.show();
+sigma = Dialog.getNumber();
+dilationIterations = Dialog.getNumber();
+threshMethod = Dialog.getChoice();
+useChannel = newArray(channels + 1);
+for (i=1; i<=channels; i++) {
+    useChannel[i] = Dialog.getCheckbox();
+}
+setBatchMode(true);
+run("Set Scale...", "distance=0 known=0 unit=pixel");
+firstMaskCreated = false;
+for (i=1; i<=channels; i++) {
+    if (useChannel[i]) {
+        selectWindow(originalTitle);
+        run("Duplicate...", "title=temp_chan duplicate channels=" + i);
+        run("Gaussian Blur...", "sigma=" + sigma);
+        setAutoThreshold(threshMethod + " dark"); 
+        run("Convert to Mask");
+        if (!firstMaskCreated) {
+            rename("AUTO_Mask");
+            firstMaskCreated = true;
+        } else {
+            run("Image Calculator...", "operation=AND create image1=[AUTO_Mask] image2=[temp_chan]");
+            selectWindow("AUTO_Mask"); close();
+            selectWindow("temp_chan"); close();
+            selectWindow("Result of AUTO_Mask"); rename("AUTO_Mask");
+        }
+    }
+}
+
+selectWindow("AUTO_Mask");
+for (i=0; i<dilationIterations; i++) {
+    run("Dilate");
+}
+run("Fill Holes");
+run("16-bit");
+run("Macro...", "code=v=(v>0)*65535");
+resetThreshold();
+selectWindow(originalTitle);
+run("Duplicate...", "title=Cleaned_Stack duplicate");
+for (i=1; i<=channels; i++) {
+    selectWindow("Cleaned_Stack");
+    setSlice(i);
+    run("Image Calculator...", "operation=Subtract image1=[Cleaned_Stack] image2=[AUTO_Mask] slice");
+}
+run("Stack to Images"); 
+selectWindow("AUTO_Mask");
+run("Images to Stack", "name=[Final_Hyperstack] title=[] use");
+run("Stack to Hyperstack...", "order=xyczt(default) channels=" + (channels + 1) + " slices=" + slices + " frames=" + frames + " display=Composite");
+setBatchMode(false);
+print("Done!");
