@@ -1,0 +1,484 @@
+import os
+import math
+from java.lang import Runtime, Thread, Runnable
+from java.util.concurrent import Executors, Callable
+from java.awt import Toolkit
+from ij import IJ, ImagePlus
+from ij.gui import Plot, PlotWindow, WaitForUserDialog, Roi, GenericDialog, NonBlockingGenericDialog
+from ij.io import RoiDecoder, RoiEncoder
+from ij.plugin.frame import RoiManager
+#My settings
+#THIS IS NOT A MACRO, THIS IS A JYTHON SCRIPT FOR FIJI, THIS ISNT TESTED FOR IMAGEJ
+# ==============================================================================
+BACKGROUND_MODE = False  # True = Uses 3/4ths of the available processors in case you're doing something else
+DEBUG_MODE      = False  # True = Forces failure state for every image
+# ==============================================================================
+#Misc User Settings
+OUTLIER_CUTOFF_PERCENT = 1.0  
+MAX_BG_INTENSITY       = 0   
+ROI_FILE_NAME          = "Background_ROIs.zip"
+CSV_REPORT_NAME        = "Batch_Processing_Summary.csv"
+# ==============================================================================
+# Don't mess with anything below this line unless you need to tweak the population metrics on line 135. 
+class GlobalPipelineFlags(object):
+    def __init__(self):
+        self.use_existing_for_all = False
+
+PIPELINE_FLAGS = GlobalPipelineFlags()
+
+class StaticThreadPoolManager(object):
+    def __init__(self):
+        self.max_cores = Runtime.getRuntime().availableProcessors()
+        if BACKGROUND_MODE:
+            self.active_cores = max(1, int(self.max_cores * 0.75))
+            IJ.log("Throttled Background Mode: using " + str(self.active_cores) + " of " + str(self.max_cores) + " cores.")
+        else:
+            self.active_cores = self.max_cores
+            IJ.log("Unthrottled Performance Mode: using " + str(self.active_cores) + " cores.")
+        self.pool = Executors.newFixedThreadPool(self.active_cores)
+
+GLOBAL_POOL_MANAGER = StaticThreadPoolManager()
+class ParallelHistogramBuilder(Callable):
+    def __init__(self, pixels, start_idx, end_idx):
+        self.pixels = pixels
+        self.start_idx = start_idx
+        self.end_idx = end_idx
+    def call(self):
+        local_hist = [0 for _ in range(65536)]
+        for i in range(self.start_idx, self.end_idx):
+            local_hist[self.pixels[i] & 0xffff] += 1
+        return local_hist
+def evaluate_fit(hist, start_x, end_x):
+    sum_x, sum_y, sum_xx, sum_yy, sum_xy, n = 0.0, 0.0, 0.0, 0.0, 0.0, 0
+    for x in range(start_x, end_x + 1):
+        count = hist[x]
+        if count > 0:
+            y = math.log10(count)
+            sum_x += x
+            sum_y += y
+            sum_xx += (x * x)
+            sum_yy += (y * y)
+            sum_xy += (x * y)
+            n += 1
+    if n < 3:
+        return None, -1.0
+    denom_slope = (n * sum_xx) - (sum_x * sum_x)
+    denom_r2 = ((n * sum_xx) - (sum_x * sum_x)) * ((n * sum_yy) - (sum_y * sum_y))
+    if denom_slope == 0 or denom_r2 <= 0:
+        return None, -1.0
+        
+    slope = ((n * sum_xy) - (sum_x * sum_y)) / denom_slope
+    intercept = (sum_y - (slope * sum_x)) / n
+    r_num = (n * sum_xy) - (sum_x * sum_y)
+    r2 = (r_num * r_num) / denom_r2
+    return (slope, intercept), r2
+
+def calculate_channel_bounds(imp, c, cached_roi_list):
+    w, h = imp.getWidth(), imp.getHeight()
+    total_pixels = w * h
+    cores = GLOBAL_POOL_MANAGER.active_cores
+    chunk = total_pixels // cores
+    
+    imp.setC(c)
+    ip = imp.getProcessor()
+    pixels = ip.getPixels()
+    border_pixels = []
+    
+    if cached_roi_list:
+        for single_roi in cached_roi_list:
+            roi_mask = single_roi.getMask()
+            bounds = single_roi.getBounds()
+            for y in range(bounds.y, bounds.y + bounds.height):
+                if y < 0 or y >= h: continue
+                offset = y * w
+                for x in range(bounds.x, bounds.x + bounds.width):
+                    if x < 0 or x >= w: continue
+                    if roi_mask is None or roi_mask.get(x - bounds.x, y - bounds.y) != 0:
+                        border_pixels.append(pixels[offset + x] & 0xffff)
+    else:
+        bx, by = int(w * 0.05), int(h * 0.05)
+        for y in list(range(0, by, 2)) + list(range(h - by, h, 2)):
+            offset = y * w
+            for x in range(0, w, 8): border_pixels.append(pixels[offset + x] & 0xffff)
+        for y in range(by, h - by, 4):
+            offset = y * w
+            for x in list(range(0, bx, 8)) + list(range(w - bx, w, 8)):
+                border_pixels.append(pixels[offset + x] & 0xffff)
+                
+    border_pixels.sort()
+    suggested_min = 0
+    if border_pixels:
+        fraction_to_keep = (100.0 - OUTLIER_CUTOFF_PERCENT) / 100.0
+        cutoff_idx = int(len(border_pixels) * fraction_to_keep)
+        if cutoff_idx >= len(border_pixels): cutoff_idx = len(border_pixels) - 1
+        suggested_min = max(0, border_pixels[cutoff_idx] - MAX_BG_INTENSITY)
+
+    tasks = []
+    for t in range(cores):
+        start = t * chunk
+        end = total_pixels if t == (cores - 1) else (start + chunk)
+        tasks.append(ParallelHistogramBuilder(pixels, start, end))
+        
+    futures = GLOBAL_POOL_MANAGER.pool.invokeAll(tasks)
+    hist = [0 for _ in range(65536)]
+    for f in futures:
+        lh = f.get()
+        for i in range(65536): hist[i] += lh[i]
+
+    mode_intensity = suggested_min
+    max_frequency = 0
+    for x in range(suggested_min, 65536):
+        if hist[x] > max_frequency:
+            max_frequency = hist[x]
+            mode_intensity = x
+
+    # Population cutoff, this is used to prevent SUPER bright pixels from killing the calculations
+    population_cutoff_limit = int(total_pixels * 0.995)
+    cumulative_pop = 0
+    pop_90_intensity_bound = 65535
+    for x in range(65536):
+        cumulative_pop += hist[x]
+        if cumulative_pop >= population_cutoff_limit:
+            pop_90_intensity_bound = x
+            break
+
+    signal_floor_detector = pop_90_intensity_bound
+    for x in range(pop_90_intensity_bound, 65535):
+        if hist[x] > 0 and hist[x+1] >= hist[x] * 1.05: 
+            signal_floor_detector = x
+            break
+
+    if DEBUG_MODE:
+        return suggested_min, 65535, -1.0, hist, mode_intensity, pop_90_intensity_bound
+
+    best_baseline_r2 = -1.0
+    baseline_max_window = mode_intensity + 50
+    scan_limit = min(65535, max(mode_intensity + 1000, signal_floor_detector))
+    
+    for test_max in range(mode_intensity + 20, scan_limit, 10):
+        fit_params, current_r2 = evaluate_fit(hist, mode_intensity, test_max)
+        if fit_params and fit_params < -0.0001:
+            if current_r2 > best_baseline_r2:
+                best_baseline_r2 = current_r2
+                baseline_max_window = test_max
+
+    optimized_max_window = baseline_max_window
+    highest_discovered_r2 = best_baseline_r2
+    
+    for experimental_cutoff in range(baseline_max_window, mode_intensity + 15, -5):
+        if experimental_cutoff < pop_90_intensity_bound: break
+        fit_params, experimental_r2 = evaluate_fit(hist, mode_intensity, experimental_cutoff)
+        if fit_params and fit_params < -0.0001:
+            if experimental_r2 > highest_discovered_r2:
+                slope, intercept = final_params if 'final_params' in locals() else fit_params
+                projected_intercept = -intercept / slope
+                if projected_intercept >= signal_floor_detector:
+                    highest_discovered_r2 = experimental_r2
+                    optimized_max_window = experimental_cutoff
+                else:
+                    break
+
+    final_params, final_r2 = evaluate_fit(hist, mode_intensity, optimized_max_window)
+    calculated_max = 65535
+    if final_params:
+        slope, intercept = final_params
+        extrapolated_x = -intercept / slope
+        calculated_max = int(round(extrapolated_x))
+
+    if calculated_max > 65535 or calculated_max <= suggested_min or calculated_max < pop_90_intensity_bound:
+        calculated_max = 65535
+
+    return suggested_min, calculated_max, final_r2, hist, mode_intensity, pop_90_intensity_bound
+class InteractiveHistogramSelector(object):
+    def __init__(self, filename, channel_idx, hist, mode_idx, suggested_min, pop_90_bound):
+        self.hist = hist
+        self.mode_idx = mode_idx
+        self.suggested_min = suggested_min
+        self.pop_90_bound = pop_90_bound
+        self.user_confirmed = False
+        self.selected_max = 65535
+        self.is_done = False  
+        
+        absolute_max_pixel = 65535
+        for x in range(65535, -1, -1):
+            if hist[x] > 0:
+                absolute_max_pixel = x
+                break
+                
+        self.x_data = []
+        self.y_data = []
+        for x in range(0, absolute_max_pixel + 100 if absolute_max_pixel < 65435 else 65535):
+            self.x_data.append(float(x))
+            val = math.log10(hist[x]) if hist[x] > 0 else 0.0
+            self.y_data.append(val)
+            
+        self.max_y_val = max(self.y_data) if self.y_data else 5.0
+        
+        self.plot_window = None
+        self.plot_obj = None
+        self.draw_vector_plot(None)
+        
+        initial_guide = int((self.suggested_min + absolute_max_pixel) / 2)
+        if initial_guide <= self.mode_idx: initial_guide = self.mode_idx + 100
+        
+        loop_active = True
+        current_fit_msg = "Running Calculation Step"
+        
+        while loop_active:
+            gd = NonBlockingGenericDialog("Manual Intercept" + str(channel_idx))
+            if DEBUG_MODE:
+                gd.addMessage("Intercept Information")
+            gd.addMessage("Current Minimum Value: " + str(self.suggested_min))
+            gd.addMessage("90% Population Value: " + str(self.pop_90_bound))
+            gd.addMessage(current_fit_msg)
+            gd.addNumericField("Enter Intercept Value:", initial_guide, 0)
+            
+            gd.setOKLabel("Lock Max")
+            gd.setCancelLabel("Calculate R Value")
+            gd.showDialog()
+            
+            user_number = int(gd.getNextNumber())
+            initial_guide = user_number
+            
+            if gd.wasCanceled():
+                neighborhood_window = int(65535 * 0.10)
+                start_search = max(self.mode_idx + 5, user_number - neighborhood_window)
+                end_search = min(65535, user_number + neighborhood_window)
+                
+                best_local_r2 = -1.0
+                best_local_max = 65535
+                best_cutoff_used = user_number
+                
+                for test_cutoff in range(start_search, end_search + 1):
+                    fit_params, r2 = evaluate_fit(self.hist, self.mode_idx, test_cutoff)
+        
+                    if fit_params and fit_params[0] < -0.0001:
+                        slope, intercept = fit_params
+                        proj_x = -intercept / slope
+                        if proj_x > self.suggested_min and proj_x <= 65535:
+                            if r2 > best_local_r2:
+                                best_local_r2 = r2
+                                best_local_max = int(round(proj_x))
+                                best_cutoff_used = test_cutoff
+                            
+                self.selected_max = best_local_max
+                self.close_plot()
+                self.draw_vector_plot(user_number)
+                
+                if self.selected_max != 65535:
+                    current_fit_msg = "Calculated Cutoff: " + str(best_cutoff_used) + " | Intercept Max: " + str(self.selected_max) + " | R2: " + str(round(best_local_r2, 4))
+                else:
+                    current_fit_msg = "Error: No valid intercept found within 10% search radius. Try again or histogram may be messy."
+                continue
+            else:
+                if self.selected_max == 65535:
+                    neighborhood_window = int(65535 * 0.10)
+                    start_search = max(self.mode_idx + 5, user_number - neighborhood_window)
+                    end_search = min(65535, user_number + neighborhood_window)
+                    for test_cutoff in range(start_search, end_search + 1):
+                        fit_params, r2 = evaluate_fit(self.hist, self.mode_idx, test_cutoff)
+                        if fit_params and fit_params[0] < -0.0001:
+                            slope, intercept = fit_params
+                            proj_x = -intercept / slope
+                            if proj_x > self.suggested_min and proj_x <= 65535:
+                                self.selected_max = int(round(proj_x))
+                                
+                self.user_confirmed = True
+                self.is_done = True  
+                loop_active = False
+
+    def draw_vector_plot(self, blue_line_val):
+        self.plot_obj = Plot("Log10 Population", "Intensity", "Log10 Pixel Count", self.x_data, self.y_data)
+        self.plot_obj.setLineWidth(1.5)
+        self.plot_obj.setColor("green")
+        self.plot_obj.drawLine(float(self.suggested_min), 0.0, float(self.suggested_min), float(self.max_y_val))
+        self.plot_obj.setColor("red")
+        self.plot_obj.drawLine(float(self.pop_90_bound), 0.0, float(self.pop_90_bound), float(self.max_y_val))
+        
+        if blue_line_val is not None:
+            self.plot_obj.setColor("blue")
+            self.plot_obj.drawLine(float(blue_line_val), 0.0, float(blue_line_val), float(self.max_y_val))
+            
+        self.plot_window = self.plot_obj.show()
+
+        if self.plot_window:
+            self.plot_window.setLocation(80, 80)
+
+    def close_plot(self):
+        if self.plot_window:
+            self.plot_window.close()
+
+
+class OperationalPipelineRunner(Runnable):
+    def __init__(self, root_dir, selected_paths):
+        self.root_dir = root_dir
+        self.selected_paths = selected_paths
+
+    def run(self):
+        roi_database = {}
+        IJ.log("ROI Phase")
+        for folder in self.selected_paths:
+            folder_name = os.path.basename(folder)
+            roi_file_path = os.path.join(folder, ROI_FILE_NAME)
+            tifs = [f for f in os.listdir(folder) if f.lower().endswith(('.tif', '.tiff'))]
+            if not tifs: continue
+            
+            load_existing, inspect_requested = False, False
+            if PIPELINE_FLAGS.use_existing_for_all and os.path.exists(roi_file_path):
+                load_existing = True
+            elif os.path.exists(roi_file_path):
+                reviewer = GenericDialog("Pre-existing ROI Found: " + folder_name)
+                reviewer.addMessage("ROI Saved for: " + folder_name)
+                
+                choice_options = ["Use Saved ROI (This folder)", "Draw New ROI", "Use Saved ROI For ALL Remaining Folders"]
+                reviewer.addRadioButtonGroup("Action Options:", choice_options, 3, 1, "Use Saved ROI (This folder)") # If I did the right version of this, it broke??? JYthon is confusing
+                reviewer.showDialog()
+                
+                if reviewer.wasCanceled():
+                    IJ.log("Run stopped by user.")
+                    return
+                    
+                selected_action = reviewer.getNextRadioButton()
+                if selected_action == "Use Saved ROI (This folder)":
+                    load_existing = True
+                elif selected_action == "Draw New ROI":
+                    load_existing = True
+                    inspect_requested = True
+                elif selected_action == "Use Saved ROI For ALL Remaining Folders":
+                    load_existing = True
+                    PIPELINE_FLAGS.use_existing_for_all = True
+                    IJ.log("Loading saved multi-ROIs.")
+            
+            rm = RoiManager.getRoiManager()
+            if not rm: rm = RoiManager()
+            rm.reset()
+            
+            if load_existing and not inspect_requested:
+                IJ.log("Loaded multi-ROI zip for: " + folder_name)
+                rm.runCommand("Open", roi_file_path)
+                roi_database[folder] = [rm.getRoi(idx) for idx in range(rm.getCount())]
+                rm.reset()
+                continue
+
+            active_imp = IJ.openImage(os.path.join(folder, tifs.pop(0)))
+            if active_imp is None: continue
+            if inspect_requested and os.path.exists(roi_file_path):
+                rm.runCommand("Open", roi_file_path)
+                rm.runCommand(active_imp, "Show All")
+                
+            active_imp.show()
+            IJ.log("Add multiple regions [Press T to add to list] to: " + folder_name)
+            IJ.runMacro("waitForUser('ROI Multi-Selector', 'Draw poly-ROI, press [T] to add.\\nAdd multiple zones, then click OK.');")
+            
+            if rm.getCount() > 0:
+                roi_database[folder] = [rm.getRoi(idx) for idx in range(rm.getCount())]
+                rm.runCommand("Save", roi_file_path)
+                IJ.log("Saved background Multi-ROI ZIP to: " + folder_name)
+            else:
+                IJ.log("No manual ROIs drawn.")
+            active_imp.close()
+            rm.reset()
+            
+        csv_rows = ["Folder,File,Channel,Calculated_Min,Calculated_Max,Calculated_R2,Status\n"]
+        IJ.log("Subtraction Phase")
+        
+        for folder in self.selected_paths:
+            folder_name = os.path.basename(folder)
+            tifs = [f for f in os.listdir(folder) if f.lower().endswith(('.tif', '.tiff'))]
+            processed_output_dir = os.path.join(folder, "Processed")
+            if not os.path.exists(processed_output_dir): os.makedirs(processed_output_dir)
+            cached_list = roi_database.get(folder, None)
+            
+            for tif_file in tifs:
+                active_imp = IJ.openImage(os.path.join(folder, tif_file))
+                if active_imp is None: continue
+                n_channels = active_imp.getNChannels()
+                if n_channels > 1: active_imp.setDisplayMode(IJ.COMPOSITE)
+                
+                skip_file = False
+                final_mins, final_maxs, final_r2s = [], [], []
+                
+                for c in range(1, n_channels + 1):
+                    c_min, c_max, r2_val, full_hist, local_mode, local_95_bound = calculate_channel_bounds(active_imp, c, cached_list)
+                    if c_max == 65535:
+                        Toolkit.getDefaultToolkit().beep()
+                        active_imp.show()
+                        
+                        # Corrected naming assignment mapping variable references matching Part 4 explicitly
+                        menu = InteractiveHistogramSelector(tif_file, c, full_hist, local_mode, c_min, local_95_bound)
+                        while not menu.is_done: Thread.sleep(100)
+                        menu.close_plot()
+                        
+                        if menu.user_confirmed:
+                            c_max = menu.selected_max
+                            r2_val = 0.9999
+                        else:
+                            skip_file = True
+                            break
+                    final_mins.append(c_min)
+                    final_maxs.append(c_max)
+                    final_r2s.append(r2_val)
+                    
+                if skip_file:
+                    active_imp.close()
+                    continue
+                    
+                for c in range(1, n_channels + 1):
+                    active_imp.setC(c)
+                    ip = active_imp.getProcessor()
+                    c_min = final_mins.pop(0)
+                    c_max = final_maxs.pop(0)
+                    r2_score = final_r2s.pop(0)
+                    
+                    status_str = "OPTIMIZED_SUCCESS" if r2_score != 0.9999 else "MANUAL_INTERVENTION_OVERRIDE"
+                    csv_rows.append(str(folder_name) + "," + str(tif_file) + "," + str(c) + "," + str(c_min) + "," + str(c_max) + "," + str(round(r2_score, 4)) + "," + status_str + "\n")
+                    
+                    input_range = float(c_max - c_min) if (c_max - c_min) > 0 else 1.0
+                    ip.add(-c_min)
+                    ip.multiply(float(65535.0).__div__(input_range))
+                    ip.setMinAndMax(0, 65535)
+                    
+                active_imp.updateAndDraw()
+                IJ.saveAsTiff(active_imp, os.path.join(processed_output_dir, tif_file))
+                active_imp.close()
+                IJ.log("Saved processed image: " + folder_name + os.sep + "Processed" + os.sep + tif_file)
+                
+        try:
+            f_write = open(os.path.join(self.root_dir, CSV_REPORT_NAME), "w")
+            for row_str in csv_rows: f_write.write(row_str)
+            f_write.close()
+            IJ.log("Done!")
+        except:
+            IJ.log("Error: Log failed to write.")
+
+def pipeline_controller():
+    root_dir = IJ.getDirectory("Select Main Parent Experiment Directory")
+    if not root_dir: return
+    
+    folder_gd = GenericDialog("Experimental Dataset Target Queue")
+    folder_gd.addMessage("Select folders to process:")
+    
+    subfolders = []
+    item_idx = 1
+    for item in os.listdir(root_dir):
+        sub_path = os.path.join(root_dir, item)
+        if os.path.isdir(sub_path):
+            if [f for f in os.listdir(sub_path) if f.lower().endswith(('.tif', '.tiff'))]:
+                folder_gd.addCheckbox("[" + str(item_idx) + "] Directory Target: " + item, True)
+                subfolders.append(sub_path)
+                item_idx += 1
+                
+    if not subfolders:
+        IJ.showMessage("Scan Error", "No subfolders containing valid images were found.")
+        return
+        
+    folder_gd.showDialog()
+    if folder_gd.wasCanceled(): return
+    
+    selected_folders = [subfolders[idx] for idx in range(len(subfolders)) if folder_gd.getNextBoolean()]
+    if selected_folders:
+        PIPELINE_FLAGS.use_existing_for_all = False 
+        runner = OperationalPipelineRunner(root_dir, selected_folders)
+        Thread(runner).start()
+
+pipeline_controller()
