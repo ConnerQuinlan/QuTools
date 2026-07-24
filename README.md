@@ -7,3 +7,7 @@ This means that each "group" will be in its own folder with each individual chan
 
 Your objective with Step 1 is to recreate the normalization based on the background subtraction and max-value capping as done in the paper. 
 Step2 is to run the autofluorescent signal removal masking. For small-plex images, do not run this. For high-plex images, run this. You may have to mess around with the settings hence the inital dialogue box. My settings that worked the best were Sigma 3, Expansion 10, Triangle method. This is designed to be run on the FULLY ASSEMBLED IMAGE, so you will need to assemble the Channel Stack tiff prior to running this. 
+
+
+QuTools-Extension.Jar is for QuPath v0.7.0 
+In order to install it, simply download the file, drag it over QuPath while it is open, and it will install it automatically. If it does not appear, please restart QuPath V0.7.0.
