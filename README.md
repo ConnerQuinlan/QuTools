@@ -1,5 +1,5 @@
 <h1>QuTools: ECM-Oriented Geometry Tools for QuPath and FIJI</h1>
-*"These are the tools that I wish I had when I started using QuPath"*
+<p>*"These are the tools that I wish I had when I started using QuPath"*</p>
 For the corresponding methods paper, I am rolling out QuTools as I translate the logic from its initial language to the various languages such as JYthon and Groovy. 
 The file structure for Step1-Fiji Batch Normalizer must be as follows with whatever names you need:
   Experiment Folder>  
