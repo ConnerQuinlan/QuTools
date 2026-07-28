@@ -12,5 +12,20 @@ Step2 is to run the autofluorescent signal removal masking. For small-plex image
 QuTools-Extension.Jar is for QuPath v0.7.0 
 In order to install it, simply download the file, drag it over QuPath while it is open, and it will install it automatically. If it does not appear, please restart QuPath V0.7.0.
 
-<video src="https://github.com/ConnerQuinlan/QuTools/blob/main/VideoTutorial/Step1.mp4" controls width="100%" autoplay loop muted></video>
+<h1>Video Tutorial</h1>
+<h2>FIJI Workflow</h2>
+<h3>Set Up Files</h3>
+https://github.com/user-attachments/assets/dd1cdd21-8720-46e2-aeed-0c47a63bc1a7
+<h3>Step 1 Script Setup</h3>
+https://github.com/user-attachments/assets/30266492-6d61-406b-9e0f-509d2584ec59
+<h3>Normalization</h3>
+https://github.com/user-attachments/assets/eefa2b29-8747-44dc-afac-0161c61aaa5a
+<h3>Noise Reduction</h3>
+https://github.com/user-attachments/assets/2f9b7ed9-87a4-4d74-88f7-ec156d82c90c
+<h2>QuPath Workflow</h2>
+<h3>Setup</h3>
+https://github.com/user-attachments/assets/854d41dc-994f-4ab0-93c3-05b4317cbe1b
+
+
+
 
