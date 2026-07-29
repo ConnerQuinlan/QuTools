@@ -79,3 +79,4 @@ run("Images to Stack", "name=[Final_Hyperstack] title=[] use");
 run("Stack to Hyperstack...", "order=xyczt(default) channels=" + (channels + 1) + " slices=" + slices + " frames=" + frames + " display=Composite");
 setBatchMode(false);
 print("Done!");
+# Please note that while the logic, workflow and normalization method were all devised by me, a LLM was utilized to assemble some of the more complex functions such as the UI
