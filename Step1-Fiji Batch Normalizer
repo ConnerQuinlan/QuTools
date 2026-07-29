@@ -7,7 +7,7 @@ from ij import IJ, ImagePlus
 from ij.gui import Plot, PlotWindow, WaitForUserDialog, Roi, GenericDialog, NonBlockingGenericDialog
 from ij.io import RoiDecoder, RoiEncoder
 from ij.plugin.frame import RoiManager
-#My settings
+
 #THIS IS NOT A MACRO, THIS IS A JYTHON SCRIPT FOR FIJI, THIS ISNT TESTED FOR IMAGEJ
 # ==============================================================================
 BACKGROUND_MODE = False  # True = Uses 3/4ths of the available processors in case you're doing something else
@@ -133,6 +133,7 @@ def calculate_channel_bounds(imp, c, cached_roi_list):
             mode_intensity = x
 
     # Population cutoff, this is used to prevent SUPER bright pixels from killing the calculations
+    # Default is 0.995 or 99.5 percent
     population_cutoff_limit = int(total_pixels * 0.995)
     cumulative_pop = 0
     pop_90_intensity_bound = 65535
@@ -482,3 +483,4 @@ def pipeline_controller():
         Thread(runner).start()
 
 pipeline_controller()
+# Please note that while the logic, workflow and normalization method were all devised by me, I utilized a LLM to translate these into JYthon because it became too complex for Macro
